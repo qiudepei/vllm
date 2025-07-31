@@ -11,20 +11,20 @@
 - 第三方平台插件需在其 `setup.py` 中注册 entry point，组名为 `vllm.platform_plugins`，如：
   ```python
   setup(
-      name='vllm_add_dummy_platform',
+      name='vllm_ascend',
       ...
       entry_points={
           'vllm.platform_plugins': [
-              "dummy_platform_plugin = vllm_add_dummy_platform:dummy_platform_plugin"
+              "ascend = vllm_ascend:register"
           ]
       }
   )
   ```
-- 插件函数（如 `dummy_platform_plugin`）返回平台类的完全限定名（如 `"vllm_add_dummy_platform.dummy_platform.DummyPlatform"`）或 `None`。
+- 插件函数（如 `ascend`）返回平台类的完全限定名（如 `"vllm_ascend.platform.NPUPlatform"`），可以。
 
 ### 1.2 vLLM 启动与插件可见性
 
-- 用户已安装第三方平台插件包（如 `pip install vllm_add_dummy_platform`）。
+- 用户已安装第三方平台插件包（如 `pip install vllm_ascend`）。
 - vLLM 进程启动时，所有通过 entry_points 注册的插件都已在 Python 环境中可见。
 
 ---
