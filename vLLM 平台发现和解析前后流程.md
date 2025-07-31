@@ -20,7 +20,7 @@
       }
   )
   ```
-- 插件函数（如 `ascend`）返回平台类的完全限定名（如 `"vllm_ascend.platform.NPUPlatform"`），可以。
+- 插件函数（如 `ascend`）返回平台类的完全限定名（如 `"vllm_ascend.platform.NPUPlatform"`），可以在vllm_ascend/__init__.py看到。
 
 ### 1.2 vLLM 启动与插件可见性
 
@@ -33,7 +33,7 @@
 
 ### 2.1 触发时机
 
-- 只有在首次访问 `vllm.platforms.current_platform` 时，才会触发平台的发现和解析（**延迟初始化**）。
+- 只有在首次访问 `vllm.platforms.current_platform` 时（比如worker_base.py中的 from vllm.platforms import current_platform），才会触发平台的发现和解析（**延迟初始化**）。
 - 相关代码在 `vllm/platforms/__init__.py` 的 `__getattr__` 方法：
 
   ```python
