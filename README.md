@@ -18,6 +18,10 @@ vllm和vllm ascend代码解读
 
 ### Deepseek
 - [DeepSeek V3.2 Sparse Attention 源码详解](./Deepseek/dsv3.2/sparse_attention.md)
+- [DeepSeek-V4-Flash 权重结构详解](./DeepSeekV4-Flash/weight_structure.md)
+  - MLA + W8A8 量化 + Shared Expert + MTP + Compressor + Indexer + HC 路由
+  - 与 Qwen3-30B-A3B 的逐项对比
+  - 顶层命名风格（`embed.weight` 无 `model.` 前缀）说明
 
 ### Scheduler / KV Cache / vLLM 平台
 - [vllm_service_startup_process.md](./vllm_service_startup_process.md)
