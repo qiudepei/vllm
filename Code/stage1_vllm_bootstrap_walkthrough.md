@@ -89,7 +89,12 @@ async def run_server_worker(listen_address, sock, args, **kwargs):
     if args.reasoning_parser_plugin: ReasoningParserManager.import_plugin(...)
 
     async with build_async_engine_client(args, ...) as engine_client:
-        # 进入:VllmConfig 构造 + AsyncLLM 创建 + EngineCore 子进程拉起
+        # 进入:
+        #   1) VllmConfig 构造
+        #   2) AsyncLLM 创建(API server 进程侧)
+        #   3) EngineCore 子进程拉起:multiprocessing.Process(target=EngineCoreProc.run_engine_core, ...)
+        #      由 CoreEngineProcManager.__init__ (vllm/v1/engine/utils.py:140-155) 创建 + proc.start() 启动
+        #      run_engine_core (core.py:1093) 是子进程入口(static method)
         # 退出:优雅 shutdown(EngineCore 子进程 kill)
         shutdown_task = await build_and_serve(engine_client, listen_address, sock, args, **kwargs)
     try:

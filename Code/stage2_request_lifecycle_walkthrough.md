@@ -203,11 +203,14 @@ async def get_output_async(self):                                       # 持续
 
 ```python
 # 子进程侧:core.py
+# run_engine_core 是 EngineCoreProc 的 @staticmethod,等价于子进程的 main()
+# 它不是被"调用"的,而是把函数引用作为 multiprocessing.Process(target=...) 的 target
+# 在 fork/spawn 之后由子进程执行。创建 Process 的地方见 stage1 §3 注释。
 def run_engine_core(*args, dp_rank=0, local_dp_rank=0, **kwargs):       # L1093
     """EngineCore main loop (in subprocess)."""
     engine_core = EngineCoreProc(*args, **kwargs)
     while True:
-        engine_core.step()                                              # ★★★ 调度 + 跑模型 主循环
+        engine_core.step()                                              # ★★★ 调度 + 跑模型 主循环(详见 stage3)
 ```
 
 **设计要点**:`AsyncLLM` 在 API server 进程,`EngineCoreProc` 在独立子进程,两者通过 **ZMQ PUSH/PULL** 通信。**好处**:① EngineCore OOM 不会拖死 API server;② 子进程崩溃时 API server 抛 `EngineDeadError` → 503 优雅失败;③ Data Parallel 时一个 API server 进程可以管理多个 EngineCore 子进程。**`EngineCoreProc.step()` 是 vllm v1 架构的核心循环** —— 里面三件事:① 从 input queue 拿新 request;② `scheduler.schedule()` 选 batch;③ `worker.execute_model(...)` 跑模型;④ outputs 塞回 output queue。**vllm-ascend 的 patch_balance_schedule / patch_attention / patch_kv_cache_coordinator / patch_multiproc_executor 都汇聚在 step 路径上**。
