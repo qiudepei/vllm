@@ -21,14 +21,30 @@ async def get_output_async(self):                                       # 持续
 ```
 
 ```python
-# core.py: 子进程入口
+# core.py: 子进程入口(static method,实际是 fork/spawn 后子进程里的 main)
 def run_engine_core(*args, dp_rank=0, local_dp_rank=0, **kwargs):       # core.py:1093
     """Launch EngineCore busy loop in background process."""
     engine_core = EngineCoreProc(*args, **kwargs)                       # 构造 EngineCore
     engine_core.run_busy_loop()                                         # ★ 永不返回(SystemExit 才退)
+
+# utils.py: 真正启动子进程的地方(target=... 是 Python multiprocessing 的标准用法)
+# CoreEngineProcManager.__init__ (utils.py:140-155)
+for index in range(local_engine_count):
+    self.processes.append(
+        context.Process(
+            target=EngineCoreProc.run_engine_core,                     # utils.py:150  函数引用当 target
+            name=f"EngineCore_DP{global_index}" if is_dp else "EngineCore",
+            kwargs=common_kwargs | {"dp_rank": ..., "local_dp_rank": ...},
+        )
+    )
+# ... proc.start()  (utils.py:194)  fork/spawn 后子进程从这里跑
 ```
 
-**关键设计**:`AsyncLLM` 在 API server 进程,`EngineCoreProc` 在独立子进程,两者通过 **ZMQ PUSH/PULL** 通信 —— input queue 收 request,output queue 推 `EngineCoreOutputs`。EngineCore OOM 不会拖死 API server,子进程崩了 API server 抛 `EngineDeadError` → 503。
+**调用链**:
+- **headless 模式**:`vllm/entrypoints/cli/serve.py:235` → `CoreEngineProcManager(...)` → `proc.start()`
+- **online 模式**:`AsyncLLM.__init__` → `core_client.py:567` `launch_core_engines(...)` 上下文管理器 → `utils.py:1132` `CoreEngineProcManager(...)` → `proc.start()`
+
+**关键设计**:`AsyncLLM` 在 API server 进程,`EngineCoreProc` 在独立子进程,两者通过 **ZMQ PUSH/PULL** 通信 —— input queue 收 request,output queue 推 `EngineCoreOutputs`。EngineCore OOM 不会拖死 API server,子进程崩了 API server 抛 `EngineDeadError` → 503。`run_engine_core` 只能以函数引用方式传给 `multiprocessing.Process(target=...)` 启动,**这正是 vllm-ascend 的 `patch_balance_schedule.py:702` 用 `EngineCoreProc.run_engine_core = run_engine_core` 直接换函数引用、zero 上游调用点改动**就能接管子进程入口的原因。
 
 ---
 
