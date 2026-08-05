@@ -88,14 +88,82 @@ async def run_server_worker(listen_address, sock, args, **kwargs):
     if args.tool_parser_plugin:     ToolParserManager.import_plugin(...)
     if args.reasoning_parser_plugin: ReasoningParserManager.import_plugin(...)
 
-    async with build_async_engine_client(args, ...) as engine_client:
-        # 进入:VllmConfig 构造 + AsyncLLM 创建 + EngineCore 子进程拉起(详见 stage2 §5 / stage3 §0)
-        # 退出:优雅 shutdown(EngineCore 子进程 kill)
+    async with build_async_engine_client(args, ...) as engine_client:   # ★ 见下方展开
         shutdown_task = await build_and_serve(engine_client, listen_address, sock, args, **kwargs)
     try:
         await shutdown_task
     finally:
         sock.close()
+
+
+# —— build_async_engine_client 完整链路(从 CLI 参数 → AsyncLLM → EngineCore 子进程) ——
+
+@asynccontextmanager                                                         # api_server.py:78
+async def build_async_engine_client(args, ...):
+    engine_args = AsyncEngineArgs.from_cli_args(args)                       # CLI → EngineArgs
+    async with build_async_engine_client_from_engine_args(engine_args, ...) as engine:  # api_server.py:100
+        yield engine
+
+@asynccontextmanager                                                         # api_server.py:109
+async def build_async_engine_client_from_engine_args(engine_args, ...):
+    vllm_config = engine_args.create_engine_config(...)                     # ① VllmConfig 构造
+    async_llm = AsyncLLM.from_vllm_config(vllm_config=vllm_config, ...)     # ② AsyncLLM 创建 → 见下方
+    yield async_llm
+    async_llm.shutdown(timeout=...)                                         # 退出时关 AsyncLLM
+
+@classmethod
+def from_vllm_config(cls, vllm_config, ...) -> "AsyncLLM":                  # async_llm.py:203
+    return cls(vllm_config, ...)                                            # → AsyncLLM.__init__
+
+class AsyncLLM(EngineClient):
+    def __init__(self, vllm_config, executor_class, ...):                   # async_llm.py:73
+        ...
+        # EngineCore (starts the engine in background process)
+        self.engine_core = EngineCoreClient.make_async_mp_client(           # async_llm.py:146  ★★★
+            vllm_config=vllm_config, executor_class=executor_class, ...,
+        )                                                                    #       → 子进程入口
+
+@staticmethod
+def make_async_mp_client(vllm_config, executor_class, log_stats, ...):       # core_client.py:108
+    return EngineCoreClient(asyncio_mode=True, vllm_config=vllm_config, ...)
+
+class EngineCoreClient:
+    def __init__(self, asyncio_mode, vllm_config, executor_class, ...):      # core_client.py:474
+        ...
+        with launch_core_engines(vllm_config, executor_class, log_stats, addresses) as (engine_manager, ...):  # core_client.py:567
+            self.resources.engine_manager = engine_manager
+
+@asynccontextmanager
+def launch_core_engines(vllm_config, executor_class, log_stats, addresses):  # utils.py:1009
+    ...
+    if local_engine_count:
+        local_engine_manager = CoreEngineProcManager(                       # utils.py:1132
+            vllm_config=vllm_config, executor_class=executor_class, ...,
+        )
+    yield local_engine_manager, coordinator, addresses, tensor_queue
+
+class CoreEngineProcManager:
+    def __init__(self, vllm_config, executor_class, log_stats, ...):         # utils.py:110
+        context = get_mp_context()
+        common_kwargs = {"vllm_config": ..., "executor_class": ..., ...}
+        for index in range(local_engine_count):
+            self.processes.append(
+                context.Process(                                             # utils.py:149
+                    target=EngineCoreProc.run_engine_core,                   # utils.py:150  ★★★★ subprocess target
+                    name="EngineCore_DP..." if is_dp else "EngineCore",
+                    kwargs=common_kwargs | {"dp_rank": ..., "local_dp_rank": ...},
+                )
+            )
+        ...
+        for proc, ... in zip(self.processes, ...):
+            ...
+            proc.start()                                                    # utils.py:194  fork/spawn → 子进程跑 run_engine_core
+
+# 子进程入口(在子进程里执行,详见 stage3 §0)
+def run_engine_core(*args, dp_rank=0, local_dp_rank=0, **kwargs):           # core.py:1093
+    engine_core = EngineCoreProc(*args, **kwargs)
+    engine_core.run_busy_loop()                                              # 永不返回
+
 
 async def build_and_serve(engine_client, listen_address, sock, args, **uvicorn_kwargs):
     supported_tasks = await engine_client.get_supported_tasks()  # 问引擎支持哪些任务
@@ -104,6 +172,25 @@ async def build_and_serve(engine_client, listen_address, sock, args, **uvicorn_k
     await init_app_state(engine_client, app.state, args, ...)     # engine_client 注入 app.state
     return await serve_http(app, sock=sock, **uvicorn_kwargs)    # 启动 uvicorn + 阻塞
 ```
+
+**设计要点**:`build_async_engine_client` 是 `@asynccontextmanager`(`api_server.py:78`),整个调用链是层层包 async with:
+
+```
+run_server_worker
+  └─ async with build_async_engine_client
+       └─ async with build_async_engine_client_from_engine_args      ← api_server.py:100
+            └─ AsyncLLM.from_vllm_config(...)                         ← api_server.py:136,AsyncLLM 创建点
+                 └─ AsyncLLM.__init__
+                      └─ EngineCoreClient.make_async_mp_client       ← async_llm.py:146
+                           └─ EngineCoreClient.__init__
+                                └─ launch_core_engines(...)          ← core_client.py:567
+                                     └─ CoreEngineProcManager(...)   ← utils.py:1132
+                                          └─ multiprocessing.Process(target=run_engine_core, ...)
+                                            └─ proc.start()           ← utils.py:194
+                                                 └─ 子进程执行 run_engine_core (core.py:1093)
+```
+
+关键节点只有 3 个:**①** `async_llm.py:146` 创建 `EngineCoreClient`(触发子进程拉起);**②** `utils.py:1132` 构造 `CoreEngineProcManager`(创建 Process 对象);**③** `utils.py:194` `proc.start()`(fork/spawn 启动子进程)。`run_engine_core`(`core.py:1093`)不是被"调用",而是 `Process(target=...)` 的 target,操作系统在子进程里执行它 —— 这也正是 vllm-ascend 的 `patch_balance_schedule.py:702` 用 `EngineCoreProc.run_engine_core = run_engine_core` 直接换函数引用、zero 上游调用点改动就能接管子进程入口的原因。
 
 **设计要点**:`build_async_engine_client` 是 `@asynccontextmanager`,**进入时建引擎、退出时拆引擎** —— 同一个 `async with` 承担"建"和"拆"两个职责,异常路径也能保证拆。`build_app` / `init_app_state` 详见 [stage2 §1](./stage2_request_lifecycle_walkthrough.md#1-build_app-装配路由api_serverpy157-307)。
 
